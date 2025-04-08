@@ -6,3 +6,10 @@ data
 __pycache__
 *.pyc
 test.*
+.bloop
+.bsp
+.metals
+.scala-build
+.vscode
+project
+target

@@ -1,0 +1,19 @@
+# Prerequisites
+
+1. **Java**: Ensure you have Java 8 or Java 11 installed.
+2. **Scala**: [Install Scala](https://www.scala-lang.org/download/) any version. 
+3. **Apache Spark**: Install Apache Spark 3.5.x.
+4. **SBT (Scala Build Tool)**: Install SBT for building and running the project. This tool come with scala install by default. If not, please install it
+
+Modify the build.sbt file to match your version
+
+## How to run the Low_Level_Operations.scala (NYCTaxiTripDuration)
+1. Navigate to the directory containing the build.sbt file and build the project using SBT.
+```bash
+cd src/NYCTaxiTripDuration/Low_Level_Operations
+sbt compile
+```
+2. Run the Scala file using SBT
+```bash
+sbt run
+```
