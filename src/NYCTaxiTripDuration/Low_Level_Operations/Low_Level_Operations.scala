@@ -1,155 +1,211 @@
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.mllib.evaluation.RegressionMetrics
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import scala.math._
 
 
+/**
+ * A class representing a Decision Tree Regressor model.
+ * 
+ * @param trainRDD RDD of training data, where each row is an array of doubles.
+ * @param maxDepth Maximum depth of the tree.
+ * @param minInstancesPerNode Minimum number of samples required to split an internal node.
+ * @param maxBins Maximum number of bins to use for quantile approximation.
+ * @param seed Random seed for sampling.
+ */
 class DecisionTreeRegressor(
     trainRDD: RDD[Array[Double]],
     maxDepth: Int = 5,
     minInstancesPerNode: Int = 1,
-    maxBins: Int = 10
+    maxBins: Int = 32,
+    seed: Int = 42
 ) extends Serializable {
+
+    // Separate features and labels and cache them
     private val X: RDD[Array[Double]] = trainRDD.map(row => row.init).cache()
     private val y: RDD[Double] = trainRDD.map(row => row.last).cache()
 
-    // Build the decision tree
+    // Build the decision tree once during initialization
     val tree: Any = buildTree(X, y, 0)
 
-    // Build the decision tree recursively
+    /**
+     * Recursively builds the decision tree.
+     * 
+     * @param X RDD of features.
+     * @param y RDD of labels.
+     * @param depth Current depth of the tree.
+     * @return The constructed decision tree.
+     */
     private def buildTree(X: RDD[Array[Double]], y: RDD[Double], depth: Int): Any = {
         val nSamples = X.count()
+        // For candidate binning, use maxBins but not more than samples available
         val numBins = math.min(maxBins, nSamples.toInt)
         val nFeatures = X.first().length
-        println(s"<====Building tree at depth $depth with $nSamples samples and $nFeatures features====>")
+
+        println(s"<==== Building tree at depth $depth with $nSamples samples and $nFeatures features ====>")
         
-        // Calculate the mean and variance of the target variables
+        // Compute target statistics
         val yMean = y.mean()
         val variance = y.map(value => math.pow(value - yMean, 2)).mean()
 
-        // Stop conditions
+        // Stopping condition: no samples, reached max depth, or node is pure
         if (nSamples == 0 || depth >= maxDepth || variance == 0) return yMean
 
-        // Find the best split
         var bestSplit: Option[(Int, Double)] = None
         var bestVariance = Double.PositiveInfinity
-        
+
+        val dataXY: RDD[(Array[Double], Double)] = X.zip(y)
+
         for (featureIndex <- 0 until nFeatures) {
-            // Compute candidate thresholds once; consider sampling or quantiles here
-            val featureRDD: RDD[Double] = X.map(row => row(featureIndex))
-            // Define the quantile levels, e.g. 10%, 20%, ..., 90%.
-            val quantileLevels = (1 until numBins).map(i => i.toDouble / numBins).toArray
-            println(s"Num bins: ${numBins} quantile levels: ${quantileLevels.mkString(", ")}")
-            // Compute approximate quantiles for the feature.
-            val candidateThresholds = approxQuantile(featureRDD, quantileLevels)
+            println(s"Processing feature $featureIndex")
 
+            // Extract values for the current feature
+            val featureValues: RDD[Double] = X.map(row => row(featureIndex))
+            // Define quantile levels, e.g., evenly spaced between 0 and 1 (excluding 0 and 1)
+            val quantileLevels: Array[Double] = (1 until numBins).map(i => i.toDouble / numBins).toArray
+
+            // Get candidate thresholds using approximate quantiles
+            val candidateThresholds: Array[Double] = approxQuantile(featureValues, quantileLevels, 0.1, seed)
+            
+            // Evaluate each candidate threshold
             for (threshold <- candidateThresholds) {
-                val leftMask = X.map(row => row(featureIndex) <= threshold)
-                val rightMask = X.map(row => row(featureIndex) > threshold)
-                
-                val leftY = y.zip(leftMask).filter(_._2).map(_._1).cache()
-                val rightY = y.zip(rightMask).filter(!_._2).map(_._1).cache()
-                
-                val leftCount = leftY.count()
-                val rightCount = rightY.count()
-                
+                // Filter the data into left and right splits using a single combined RDD
+                val leftData: RDD[(Array[Double], Double)] = dataXY.filter { case (features, label) =>
+                    features(featureIndex) <= threshold
+                }
+                val rightData: RDD[(Array[Double], Double)] = dataXY.filter { case (features, label) =>
+                    features(featureIndex) > threshold
+                }
+
+                val leftCount = leftData.count()
+                val rightCount = nSamples - leftCount
+
                 if (leftCount >= minInstancesPerNode && rightCount >= minInstancesPerNode) {
-                val leftMean = leftY.mean()
-                val rightMean = rightY.mean()
+                    // Compute means for left and right splits
+                    val leftMean = leftData.map(_._2).mean()
+                    val rightMean = rightData.map(_._2).mean()
 
-                val leftVariance = if (leftCount > 0) leftY.map(value => math.pow(value - leftMean, 2)).mean() else 0
-                val rightVariance = if (rightCount > 0) rightY.map(value => math.pow(value - rightMean, 2)).mean() else 0
+                    // Compute variance for left and right splits
+                    val leftVar = if (leftCount > 0) leftData.map { case (_, label) => math.pow(label - leftMean, 2)}.mean() else 0.0
+                    val rightVar = if (rightCount > 0) rightData.map { case (_, label) => math.pow(label - rightMean, 2)}.mean() else 0.0
 
-                val weightedVariance = (leftVariance * leftCount + rightVariance * rightCount) / nSamples
-                
-                if (weightedVariance < bestVariance) {
-                    bestVariance = weightedVariance
-                    bestSplit = Some((featureIndex, threshold))
+                    // Weighted variance over the node
+                    val weightedVariance = (leftVar * leftCount + rightVar * rightCount) / nSamples
+
+                    if (weightedVariance < bestVariance) {
+                        bestVariance = weightedVariance
+                        bestSplit = Some((featureIndex, threshold))
+                    }
                 }
-                }
-
-                leftY.unpersist()
-                rightY.unpersist()
             }
         }
 
+        // If no valid split is found, return the mean as a leaf node
         if (bestSplit.isEmpty) return yMean
-        
+
+        println(s"Best split found at feature ${bestSplit.get._1} with threshold ${bestSplit.get._2}")
+
         val (featureIndex, threshold) = bestSplit.get
 
-        // Split the data into left and right branches
-        val leftMask = X.map(row => row(featureIndex) <= threshold)
-        val rightMask = X.map(row => row(featureIndex) > threshold)
+        // Now, split the data using the best split found
+        val dataXYSplit: RDD[(Array[Double], Double)] = X.zip(y).cache()
 
-        val leftX = X.zip(leftMask).filter(_._2).map(_._1).cache()
-        val rightX = X.zip(rightMask).filter(!_._2).map(_._1).cache()
+        val leftData = dataXYSplit.filter { case (features, label) => features(featureIndex) <= threshold }.cache()
+        val rightData = dataXYSplit.filter { case (features, label) => features(featureIndex) > threshold }.cache()
 
-        val leftY = y.zip(leftMask).filter(_._2).map(_._1).cache()
-        val rightY = y.zip(rightMask).filter(!_._2).map(_._1).cache()
-        
-        // Recursively build trees
+        val leftX = leftData.map(_._1).cache()
+        val leftY = leftData.map(_._2).cache()
+        val rightX = rightData.map(_._1).cache()
+        val rightY = rightData.map(_._2).cache()
+
+        // Recursively build the left and right subtrees
         val leftTree = buildTree(leftX, leftY, depth + 1)
         val rightTree = buildTree(rightX, rightY, depth + 1)
-        
+
+        // Unpersist intermediate RDDs
+        dataXYSplit.unpersist()
+        leftData.unpersist()
+        rightData.unpersist()
         leftX.unpersist()
-        rightX.unpersist()
         leftY.unpersist()
+        rightX.unpersist()
         rightY.unpersist()
 
         Map(
-        "featureIndex" -> featureIndex,
-        "threshold" -> threshold,
-        "left" -> leftTree,
-        "right" -> rightTree
+            "featureIndex" -> featureIndex,
+            "threshold" -> threshold,
+            "left" -> leftTree,
+            "right" -> rightTree
         )
     }
 
+    /**
+     * Computes approximate quantiles using a sample of the data.
+     * 
+     * @param rdd RDD of feature values.
+     * @param probabilities Array of probabilities for which to compute quantiles.
+     * @param sampleFraction Fraction of data to sample for quantile approximation.
+     * @param seed Random seed for sampling.
+     * @return Array of approximate quantiles.
+     */
     def approxQuantile(
         rdd: RDD[Double],
-        probalities: Array[Double],
-        sampleFraction: Double = 0.1
+        probabilities: Array[Double],
+        sampleFraction: Double = 0.1,
+        seed: Int = 42
     ): Array[Double] = {
-        val sampledRDD = rdd.sample(withReplacement = false, sampleFraction).collect()
-        
-        val sortedSample = sampledRDD.sorted
+        val sampledData = rdd.sample(false, sampleFraction, seed).collect()
+
+        if (sampledData.isEmpty) {
+            return rdd.collect().sorted
+        }
+
+        // Sort the sampled data
+        val sortedSample = sampledData.sorted
         val n = sortedSample.length
 
-        // For each quantile level q, compute the index in the sorted array.
-        probalities.map { q =>
-            val index = math.min(n - 1, math.floor(q * n).toInt)
-            sortedSample(index)
+        // Compute approximate quantiles
+        probabilities.map { q =>
+            val idx = math.min(n - 1, math.floor(q * n).toInt)
+            sortedSample(idx)
         }
     }
 
-    // Traverse the tree to make predictions
-    private def traverseTree(tree: Any, X: Array[Double]): Double = {
+    /**
+     * Traverses the decision tree to make a prediction.
+     * 
+     * @param tree The decision tree.
+     * @param features The feature vector for which to make a prediction.
+     * @return The predicted value.
+     */
+    private def traverseTree(tree: Any, features: Array[Double]): Double = {
         tree match {
-        case node if node.isInstanceOf[Map[String, Any]] =>
-            val mapNode = node.asInstanceOf[Map[String, Any]]
-            val featureIndex = mapNode("featureIndex").asInstanceOf[Int]
-            val threshold = mapNode("threshold").asInstanceOf[Double]
-            if (X(featureIndex) <= threshold) {
-            traverseTree(mapNode("left"), X)
-            } else {
-            traverseTree(mapNode("right"), X)
-            }
-        case leaf: Double => leaf
-        case None => 
-            println("Warning: Encountered None in the tree. Returning default value 0.0.")
-            0.0
+            case node: Map[String, Any] =>
+                val featureIndex = node("featureIndex").asInstanceOf[Int]
+                val threshold = node("threshold").asInstanceOf[Double]
+                if (features(featureIndex) <= threshold)
+                    traverseTree(node("left"), features)
+                else
+                    traverseTree(node("right"), features)
+            case leaf: Double => leaf
         }
     }
 
-    def predict(testRDD: RDD[Array[Double]]): RDD[Double] = {
-        testRDD.map(features => traverseTree(tree, features))
+    /**
+     * Predicts the target value for a given feature vector.
+     * 
+     * @param features The feature vector for which to make a prediction.
+     * @return The predicted value.
+     */
+    def predict(features: Array[Double]): Double = {
+        traverseTree(tree, features)
     }
 }
 
+
 object Low_Level_Operations {
     def main(args: Array[String]): Unit = {
-        // Initialize SparkSession
         val spark = SparkSession.builder()
                                 .appName("DecisionTreeRegressor")
                                 .master("local[*]")
@@ -164,7 +220,7 @@ object Low_Level_Operations {
         val header: String = lines.first()
         val dataRDD: RDD[String] = lines.filter(line => line != header)
 
-        // Define a function to process each line
+        // A function to process each line. Feature engineering, conversion to numeric types.
         def processTripLine(line: String): Array[Double] = {
             val fields = line.split(",")
             val pickupDatetime = LocalDateTime.parse(fields(2), DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
@@ -192,33 +248,51 @@ object Low_Level_Operations {
             )
         }
 
-        // Apply the processing function to each line
         val processedRDD: RDD[Array[Double]] = dataRDD.map(processTripLine)
 
         // Filter the data based on the conditions
         val filteredRDD: RDD[Array[Double]] = processedRDD.filter(row => row(0) > 0) // passenger_count > 0
                                                         .filter(row => row(7) < 22 * 3600) // trip_duration < 22 hours
                                                         .filter(row => row(3) > 0) // distance > 0
-
-        // Print the first few rows for verification
-        filteredRDD.take(5).foreach(row => println(row.mkString(", ")))
         
         val Array(trainRDD, testRDD) = filteredRDD.randomSplit(Array(0.8, 0.2), seed = 42)
 
-        val regressor = new DecisionTreeRegressor(trainRDD, maxDepth = 5, minInstancesPerNode = 1)
+        val model = new DecisionTreeRegressor(trainRDD, maxDepth = 5, minInstancesPerNode = 1)
+        println("Decision Tree Regressor model built successfully.")
 
-        // Predict on the test set
-        val predictions: RDD[Double] = regressor.predict(testRDD.map(row => row.init))
+        val sampleTestCases = testRDD.take(10)
+        println("Sample test cases:")
+        sampleTestCases.foreach { row =>
+            val prediction: Double = model.predict(row.init)
+            println(s"Features: ${row.init.mkString(", ")}, Acutal: ${row.last} Prediction: $prediction")
+        }
 
-        // Combine predictions with actual labels
-        val predictionsAndLabels: RDD[(Double, Double)] = predictions.zip(testRDD.map(row => row.last))
-        
-        val metrics = new RegressionMetrics(predictionsAndLabels)
+        val labelsAndPredictions = testRDD.map { row =>
+            val prediction: Double = model.predict(row.init)
+            (row.last, prediction)
+        }
 
-        println(s"Root Mean Squared Error (RMSE): ${metrics.rootMeanSquaredError}")
-        println(s"Mean Absolute Error (MAE): ${metrics.meanAbsoluteError}")
+        // Mean Absolute Error
+        val testMAE = labelsAndPredictions.map { case (v, p) => math.abs(v - p) }.mean()
+        println(s"Test Mean Absolute Error (MAE) = $testMAE")
 
-        // Stop SparkSession
+        // Root Mean Squared Error
+        val testRMSE = sqrt(labelsAndPredictions.map{ case (v, p) => math.pow(v - p, 2) }.mean())
+        println(s"Test Root Mean Squared Error (RMSE) = $testRMSE")
+
+        val yMean = labelsAndPredictions.map(_._1).mean()
+        // Residual sum of squares
+        val ssRes = labelsAndPredictions.map { case (label, prediction) =>
+            math.pow(label - prediction, 2)
+        }.sum()
+
+        // Total sum of squares
+        val ssTot = labelsAndPredictions.map { case (label, _) =>
+            math.pow(label - yMean, 2)
+        }.sum()
+        val r2 = 1 - ssRes / ssTot
+        println(s"Test R^2 = $r2")
+
         spark.stop()
     }
 }
